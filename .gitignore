@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# OS
+.DS_Store
+
+# Personal — don't commit anyone's actual exported data
+granola_export/
+*.b64
+manifest.json
+
+# Local config
+.env
+.granola-to-drive.env
