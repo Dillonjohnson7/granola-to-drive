@@ -16,6 +16,7 @@ Writes:
 
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
@@ -189,7 +190,7 @@ def summary_text(doc_id: str) -> str:
     if not p.exists():
         return ""
     try:
-        panels = json.load(open(p))
+        panels = json.loads(p.read_text())
     except Exception:
         return ""
     if not isinstance(panels, list) or not panels:
@@ -211,7 +212,7 @@ def transcript_text(doc_id: str, base_iso: str | None) -> str:
     if not p.exists():
         return "(no transcript available)"
     try:
-        segs = json.load(open(p))
+        segs = json.loads(p.read_text())
     except Exception:
         return "(transcript file unreadable)"
     if not isinstance(segs, list) or not segs:
@@ -253,6 +254,21 @@ def _sanitize_filename(name: str) -> str:
     name = name.replace("/", "-").replace("\x00", "")
     name = re.sub(r"\s+", " ", name).strip().rstrip(".").strip()
     return name or "untitled"
+
+
+def without_header_tags(text: str) -> str:
+    """Ignore the tagger's header line when comparing rendered meeting content."""
+    header, separator, rest = text.partition("\n\n")
+    header = re.sub(r"(?m)^(Granola Meeting ID:[^\n]*)\nTags:[^\n]*", r"\1", header, count=1)
+    return header + separator + rest
+
+
+def write_dossier(path: Path, body: str) -> bool:
+    """Keep existing tags and mtime when the source content is unchanged."""
+    if path.exists() and without_header_tags(path.read_text()) == body:
+        return False
+    path.write_text(body)
+    return True
 
 
 def build_one(doc: dict) -> tuple[str, str, str]:
@@ -302,21 +318,27 @@ def build_one(doc: dict) -> tuple[str, str, str]:
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    docs = json.load(open(ROOT / "documents.json"))
+    docs = json.loads((ROOT / "documents.json").read_text())
     manifest = []
+    changed = 0
     used_paths: dict[str, str] = {}  # filename -> doc_id of file that took the slot
     for doc in docs:
         if doc.get("deleted_at") or doc.get("was_trashed"):
             continue
         fs_name, drive_title, body = build_one(doc)
-        # Disambiguate if two meetings happen to share the same date+title
-        if fs_name in used_paths and used_paths[fs_name] != doc["id"]:
-            stem, ext = fs_name.rsplit(".", 1) if "." in fs_name else (fs_name, "txt")
-            fs_name = f"{stem} [{doc['id'][:8]}].{ext}"
-        used_paths[fs_name] = doc["id"]
+        # macOS commonly treats case and Unicode normalization as equivalent.
+        stem, ext = fs_name.rsplit(".", 1)
+        suffix = 0
+        key = unicodedata.normalize("NFD", fs_name).casefold()
+        while key in used_paths and used_paths[key] != doc["id"]:
+            label = doc["id"][:8] + (f"-{suffix}" if suffix else "")
+            fs_name = f"{stem} [{label}].{ext}"
+            key = unicodedata.normalize("NFD", fs_name).casefold()
+            suffix += 1
+        used_paths[key] = doc["id"]
         path = OUT / fs_name
-        with open(path, "w") as f:
-            f.write(body)
+        if write_dossier(path, body):
+            changed += 1
         manifest.append(
             {
                 "id": doc["id"],
@@ -330,9 +352,11 @@ def main():
         )
 
     manifest.sort(key=lambda m: m["date"] or "", reverse=True)
-    with open(OUT / "manifest.json", "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"Built {len(manifest)} dossiers into {OUT}")
+    manifest_path = OUT / "manifest.json"
+    manifest_text = json.dumps(manifest, indent=2)
+    if not manifest_path.exists() or manifest_path.read_text() != manifest_text:
+        manifest_path.write_text(manifest_text)
+    print(f"Built {len(manifest)} dossiers ({changed} changed, {len(manifest)-changed} unchanged) into {OUT}")
     print(f"Manifest: {OUT/'manifest.json'}")
 
 

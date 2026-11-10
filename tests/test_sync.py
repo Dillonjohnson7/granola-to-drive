@@ -1,15 +1,19 @@
 import base64
 import json
+import io
 import os
 import subprocess
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 import fetch_granola as fetch
 import granola_auth as auth
+import build_docs as build
+import tag_meetings as tag
 
 
 def token(exp):
@@ -95,6 +99,49 @@ class AuthTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
+    def test_unchanged_archive_makes_no_transcript_or_summary_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "transcripts").mkdir()
+            (root / "panels").mkdir()
+            docs = [{"id": "a", "created_at": "2025-01-01T10:00:00Z", "updated_at": "same"}]
+            (root / "documents.json").write_text(json.dumps(docs))
+            (root / "transcripts/a.json").write_text('[{"text":"Complete transcript"}]')
+            (root / "panels/a.json").write_text('[{"original_content":"<p>Summary</p>"}]')
+            with patch.object(fetch, "OUT", root), \
+                 patch.object(fetch, "TRANSCRIPTS_DIR", root / "transcripts"), \
+                 patch.object(fetch, "PANELS_DIR", root / "panels"), \
+                 patch.object(fetch, "load_token", return_value="test"), \
+                 patch.object(fetch, "fetch_documents", return_value=docs), \
+                 patch.object(fetch, "fetch_transcript") as transcript, \
+                 patch.object(fetch, "fetch_panels") as panels:
+                with redirect_stdout(io.StringIO()):
+                    fetch.main()
+            transcript.assert_not_called()
+            panels.assert_not_called()
+
+    def test_recent_recording_is_rechecked_for_final_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "transcript.json"
+            path.write_text('[{"text":"Still recording"}]')
+            now = time.time()
+            os.utime(path, (now - 3601, now - 3601))
+            created = auth.time.strftime("%Y-%m-%dT%H:%M:%SZ", auth.time.gmtime(now - 7200))
+            doc = {"created_at": created}
+            self.assertIn("final content", fetch.cache_refresh_reason(path, doc, doc))
+            os.utime(path, (now, now))
+            self.assertTrue(fetch.cache_current(path, doc, doc))
+
+    def test_populated_but_empty_summary_is_retried_daily(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "panels"
+            folder.mkdir()
+            path = folder / "a.json"
+            path.write_text('[{"original_content":"","content":{}}]')
+            self.assertTrue(fetch.cache_current(path, {}, {}))
+            os.utime(path, (1, 1))
+            self.assertIn("daily retry", fetch.cache_refresh_reason(path, {}, {}))
+
     def test_current_response(self):
         docs = [{"id": "a"}]
         with patch.object(fetch, "post", return_value=(200, {"docs": docs})):
@@ -147,6 +194,61 @@ class FetchTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     fetch.main()
             self.assertEqual(json.loads((root / "documents.json").read_text()), original)
+
+
+class BuildTests(unittest.TestCase):
+    def test_case_only_filename_collision_preserves_both_meetings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = root / "built"
+            docs = [{"id": "first-id", "title": "Catch up", "created_at": "2025-12-04T10:00:00Z"},
+                    {"id": "second-id", "title": "catch up", "created_at": "2025-12-04T11:00:00Z"}]
+            (root / "documents.json").write_text(json.dumps(docs))
+            with patch.object(build, "ROOT", root), patch.object(build, "OUT", built), redirect_stdout(io.StringIO()):
+                build.main()
+                manifest = json.loads((built / "manifest.json").read_text())
+                self.assertEqual(len({m["filename"].casefold() for m in manifest}), 2)
+                for m in manifest:
+                    self.assertIn("Granola Meeting ID: " + m["id"], Path(m["path"]).read_text())
+                for p in built.iterdir():
+                    os.utime(p, (10, 10))
+                build.main()
+                self.assertTrue(all(p.stat().st_mtime == 10 for p in built.iterdir()))
+
+    def test_second_build_and_tag_preserve_content_and_mtimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            built = root / "built"
+            (root / "transcripts").mkdir()
+            (root / "panels").mkdir()
+            doc = {"id": "a", "title": "Call about fundraising", "created_at": "2025-01-01T10:00:00Z",
+                   "notes_plain": "Tags: a line in private notes"}
+            (root / "documents.json").write_text(json.dumps([doc]))
+            (root / "transcripts/a.json").write_text('[{"text":"Complete transcript"}]')
+            (root / "panels/a.json").write_text('[{"original_content":"<p>Summary</p>"}]')
+            with patch.object(build, "ROOT", root), patch.object(build, "OUT", built), \
+                 patch.object(tag, "BUILT", built), redirect_stdout(io.StringIO()):
+                build.main()
+                tag.main()
+                paths = list(built.iterdir())
+                contents = {p: p.read_bytes() for p in paths}
+                for p in paths:
+                    os.utime(p, (10, 10))
+                build.main()
+                tag.main()
+                self.assertEqual({p: p.read_bytes() for p in paths}, contents)
+                self.assertTrue(all(p.stat().st_mtime == 10 for p in paths))
+                dossier = next(built.glob("*.txt"))
+                self.assertIn("Tags: a line in private notes", dossier.read_text())
+                (root / "transcripts/a.json").write_text('[{"text":"Final, improved transcript"}]')
+                build.main()
+                tag.main()
+                self.assertIn("Final, improved transcript", dossier.read_text())
+                self.assertGreater(dossier.stat().st_mtime, 10)
+                with patch.object(tag, "TITLE_RULES", [(r".*", "industry-talk", [])]):
+                    build.main()
+                    tag.main()
+                self.assertIn("Tags: industry-talk", dossier.read_text())
 
 
 class RefreshTests(unittest.TestCase):

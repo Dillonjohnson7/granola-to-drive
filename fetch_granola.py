@@ -22,6 +22,7 @@ import time
 import urllib.request
 import urllib.error
 import zlib
+from datetime import datetime
 from pathlib import Path
 from granola_auth import AuthError, atomic_json, client_version, load_token
 
@@ -149,17 +150,36 @@ def fetch_panels(token, doc_id):
     return resp, None
 
 
-def cache_current(path, doc, previous):
+def cache_refresh_reason(path, doc, previous):
     if not path.exists():
-        return False
+        return "missing cache"
     if doc.get("updated_at") != previous.get("updated_at"):
-        return False
+        return "meeting updated in Granola"
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
-        return False
-    # A meeting can still be recording/generating when first fetched.
-    return isinstance(data, list) and (bool(data) or time.time() - path.stat().st_mtime < 86400)
+        return "unreadable cache"
+    if not isinstance(data, list) or any(not isinstance(item, dict) for item in data):
+        return "invalid cache schema"
+    age = time.time() - path.stat().st_mtime
+    if path.parent.name == "panels":
+        complete = any(not item.get("deleted_at") and item.get("original_content") for item in data)
+    else:
+        complete = any((item.get("text") or "").strip() for item in data)
+    if not complete and age >= 86400:
+        return "incomplete content; daily retry"
+    # Metadata can lag behind a still-recording meeting or a late summary.
+    try:
+        created = datetime.fromisoformat(doc.get("created_at", "").replace("Z", "+00:00")).timestamp()
+        if 0 <= time.time() - created < 6 * 3600 and age >= 3600:
+            return "recent meeting; checking for final content"
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return None
+
+
+def cache_current(path, doc, previous):
+    return cache_refresh_reason(path, doc, previous) is None
 
 
 def main():
@@ -184,6 +204,8 @@ def main():
 
     success, skip, fail = 0, 0, 0
     failures = []
+    refresh_reasons = {}
+    panel_success, panel_skip = 0, 0
 
     for i, doc in enumerate(docs, 1):
         if doc.get("deleted_at") or doc.get("was_trashed"):
@@ -199,10 +221,12 @@ def main():
         p_path = PANELS_DIR / f"{doc_id}.json"
 
         # Transcript
-        if cache_current(t_path, doc, previous.get(doc_id, {})):
+        t_reason = cache_refresh_reason(t_path, doc, previous.get(doc_id, {}))
+        if t_reason is None:
             t_status = "cached"
             skip += 1
         else:
+            refresh_reasons[t_reason] = refresh_reasons.get(t_reason, 0) + 1
             t, err = fetch_transcript(token, doc_id)
             if err:
                 t_status = f"FAIL ({err})"
@@ -214,19 +238,27 @@ def main():
                 t_status = f"{segs} segs"
                 success += 1
 
-        if not cache_current(p_path, doc, previous.get(doc_id, {})):
+        p_reason = cache_refresh_reason(p_path, doc, previous.get(doc_id, {}))
+        if p_reason is not None:
+            refresh_reasons[p_reason] = refresh_reasons.get(p_reason, 0) + 1
             p, _err = fetch_panels(token, doc_id)
             if p is not None:
                 atomic_json(p_path, p)
+                panel_success += 1
             else:
                 fail += 1
                 failures.append((doc_id, title, f"Summary: {_err}"))
+        else:
+            panel_skip += 1
 
         print(f"[{i}/{len(docs)}] {title}: {t_status}")
         if t_status != "cached":
             time.sleep(0.3)  # gentle on the API
 
     print(f"\nDone. transcripts: {success} fetched, {skip} cached; {fail} fetch errors.")
+    print(f"Summaries: {panel_success} fetched, {panel_skip} cached.")
+    for reason, count in sorted(refresh_reasons.items()):
+        print(f"  Refetched {count} resources: {reason}.")
     print(f"Output: {OUT}")
     if failures:
         print("\nFailures:")

@@ -161,6 +161,10 @@ bash -n install.sh refresh.sh
 
 Fetches preserve the previous document index on failures, retry changed meetings, and retry old empty transcript/summary responses after 24 hours. Uploads use `rclone copy`, so files already in Drive are not deleted.
 
+Each run checks Granola's meeting index for new or changed meetings. Complete cached transcripts and summaries are reused. A resource is downloaded again only when its cache is missing/unreadable, Granola reports a meeting update, incomplete content is due for a daily retry, or a meeting created in the last six hours needs an hourly check for final content. The log reports these refresh reasons. Unchanged dossiers retain their tags and modification times, so Drive does not need hundreds of timestamp updates on every run. A changed transcript, summary, notes, or tagging rule still updates the corresponding file.
+
+Meeting filenames are disambiguated using case-insensitive Unicode comparisons, so titles such as `Catch up` and `catch up` on the same date remain separate files on macOS.
+
 Run verification from the repository root. The nested `granola-to-drive/` directory is a compatibility copy of the scripts; keep it in sync with the repository root when changing them.
 
 ## License
