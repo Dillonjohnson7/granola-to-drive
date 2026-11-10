@@ -17,6 +17,7 @@ import json
 import os
 import re
 from pathlib import Path
+from build_docs import without_header_tags
 
 ROOT = Path(os.environ.get(
     "GRANOLA_EXPORT_DIR",
@@ -246,23 +247,10 @@ def inject_tags(file_path: Path, primary: str, secondary: list[str]) -> bool:
     """Replace or add a `Tags:` line just below `Granola Meeting ID:`. Returns True if changed."""
     tag_line = f"Tags: {primary}" + (" | " + ", ".join(secondary) if secondary else "")
     text = file_path.read_text()
-    lines = text.splitlines()
-    out = []
-    inserted = False
-    skipped_existing = False
-    for i, ln in enumerate(lines):
-        if ln.startswith("Tags: ") and not skipped_existing:
-            skipped_existing = True
-            continue
-        out.append(ln)
-        if not inserted and ln.startswith("Granola Meeting ID:"):
-            out.append(tag_line)
-            inserted = True
-    new_text = "\n".join(out)
-    if not text.endswith("\n"):
-        pass
-    else:
-        new_text += "\n"
+    header, separator, rest = without_header_tags(text).partition("\n\n")
+    header = re.sub(r"(?m)^(Granola Meeting ID:[^\n]*)", lambda m: m[0] + "\n" + tag_line,
+                    header, count=1)
+    new_text = header + separator + rest
     if new_text == text:
         return False
     file_path.write_text(new_text)
@@ -270,7 +258,7 @@ def inject_tags(file_path: Path, primary: str, secondary: list[str]) -> bool:
 
 
 def main():
-    manifest = json.load(open(BUILT / "manifest.json"))
+    manifest = json.loads((BUILT / "manifest.json").read_text())
     counts_primary: dict[str, int] = {}
     counts_secondary: dict[str, int] = {}
     changed = 0
@@ -280,7 +268,7 @@ def main():
             print(f"WARN: missing {entry['filename']}")
             continue
         body = path.read_text()
-        primary, secondary = classify(entry["id"], entry["title"] or "", body)
+        primary, secondary = classify(entry["id"], entry["title"] or "", without_header_tags(body))
         counts_primary[primary] = counts_primary.get(primary, 0) + 1
         for s in secondary:
             counts_secondary[s] = counts_secondary.get(s, 0) + 1
